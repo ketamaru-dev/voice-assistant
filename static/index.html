@@ -207,48 +207,81 @@
 
     function startListening(btn) {
       if (!SR) return setState('idle', 'Браузер не поддерживает распознавание речи');
-      speechSynthesis.cancel();
-      clearTimeout(silenceTimer);
+      if ('speechSynthesis' in window) speechSynthesis.cancel();
+      if (silenceTimer) clearTimeout(silenceTimer);
+
       activeMic = btn;
       srcSelect = btn === micFrom ? from : to;
       tgtSelect = btn === micFrom ? to : from;
       const srcLang = srcSelect.value;
 
-      recognition = new SR();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = LANGS[srcLang] || srcLang;
-      finalTranscript = interimTranscript = '';
-      recError = null;
-
-      recognition.onresult = e => {
-        if (silenceTimer) clearTimeout(silenceTimer);
-        let interim = '';
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          const t = e.results[i][0].transcript;
-          if (e.results[i].isFinal) finalTranscript += t;
-          else interim += t;
+      try {
+        if (recognition) {
+          try { recognition.abort(); } catch (e) {}
         }
-        interimTranscript = interim;
-        showText(sourceEl, normalize(srcLang, finalTranscript + interim), 'Здесь появится распознанный текст…');
-        silenceTimer = setTimeout(() => {
-          console.log("Пауза выдержана. Останавливаем запись и отправляем...");
-          recognition.stop();
-        }, SILENCE_TIMEOUT_MS);
-      };
-      recognition.onerror = e => { recError = e.error; };
-      recognition.onend = () => {
-        clearTimeout(silenceTimer);
-        const text = normalize(srcLang, (finalTranscript || interimTranscript).trim());
-        if (recError === 'not-allowed' || recError === 'service-not-allowed') return setState('idle', 'Нет доступа к микрофону');
-        if (!text) return setState('idle', recError && recError !== 'no-speech' && recError !== 'aborted' ? 'Ошибка распознавания: ' + recError : 'Речь не обнаружена');
-        showText(sourceEl, text, '');
-        sendText(text, srcLang, tgtSelect.value);
-      };
 
-      showText(sourceEl, '', 'Здесь появится распознанный текст…');
-      recognition.start();
-      setState('listening', 'Слушаю...');
+        const rec = new SR();
+        recognition = rec;
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = LANGS[srcLang] || srcLang;
+        finalTranscript = interimTranscript = '';
+        recError = null;
+
+        // События от прерванного (старого) экземпляра игнорируем, чтобы они не ломали новую сессию
+        rec.onresult = e => {
+          if (rec !== recognition) return;
+          if (silenceTimer) clearTimeout(silenceTimer);
+          let interim = '';
+          for (let i = e.resultIndex; i < e.results.length; i++) {
+            const t = e.results[i][0].transcript;
+            if (e.results[i].isFinal) finalTranscript += t;
+            else interim += t;
+          }
+          interimTranscript = interim;
+          showText(sourceEl, normalize(srcLang, finalTranscript + interim), 'Здесь появится распознанный текст…');
+          silenceTimer = setTimeout(() => {
+            console.log("Пауза выдержана. Останавливаем запись...");
+            rec.stop();
+          }, SILENCE_TIMEOUT_MS);
+        };
+
+        rec.onerror = e => {
+          if (rec !== recognition || e.error === 'aborted') return;
+          console.error("SpeechRecognition error:", e.error);
+          recError = e.error;
+          if (silenceTimer) clearTimeout(silenceTimer);
+
+          let errorMsg = 'Ошибка: ' + e.error;
+          if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+            errorMsg = 'Заблокирован микрофон в Android / Chrome';
+          } else if (e.error === 'network') {
+            errorMsg = 'Нужен доступ в интернет для распознавания';
+          } else if (e.error === 'no-speech') {
+            errorMsg = 'Речь не обнаружена';
+          }
+
+          setState('idle', errorMsg);
+        };
+
+        rec.onend = () => {
+          if (rec !== recognition) return;
+          if (silenceTimer) clearTimeout(silenceTimer);
+          if (state !== 'listening') return;
+
+          const text = normalize(srcLang, (finalTranscript || interimTranscript).trim());
+          if (!text) return setState('idle', 'Речь не обнаружена');
+          showText(sourceEl, text, '');
+          sendText(text, srcLang, tgtSelect.value);
+        };
+
+        showText(sourceEl, '', 'Здесь появится распознанный текст…');
+        setState('listening', 'Слушаю...');
+        rec.start();
+      } catch (err) {
+        console.error("Failed to start SpeechRecognition:", err);
+        setState('idle', 'Сбой запуска: ' + err.message);
+      }
     }
 
     async function sendText(text, srcLang, tgtLang) {
