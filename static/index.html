@@ -205,6 +205,20 @@
       }
     }
 
+    // Android Chrome в режиме continuous присылает накопительные результаты (каждый содержит
+    // предыдущий текст), поэтому текст собираем заново из всех результатов без дублей
+    function mergeResults(results, lang) {
+      const sep = lang === 'zh' || lang === 'ja' ? '' : ' ';
+      let acc = '';
+      for (let i = 0; i < results.length; i++) {
+        const t = results[i][0].transcript.trim();
+        if (!t) continue;
+        if (!acc || t.startsWith(acc)) acc = t;
+        else if (!acc.endsWith(t)) acc += sep + t;
+      }
+      return acc;
+    }
+
     function startListening(btn) {
       if (!SR) return setState('idle', 'Браузер не поддерживает распознавание речи');
       if ('speechSynthesis' in window) speechSynthesis.cancel();
@@ -232,14 +246,9 @@
         rec.onresult = e => {
           if (rec !== recognition) return;
           if (silenceTimer) clearTimeout(silenceTimer);
-          let interim = '';
-          for (let i = e.resultIndex; i < e.results.length; i++) {
-            const t = e.results[i][0].transcript;
-            if (e.results[i].isFinal) finalTranscript += t;
-            else interim += t;
-          }
-          interimTranscript = interim;
-          showText(sourceEl, normalize(srcLang, finalTranscript + interim), 'Здесь появится распознанный текст…');
+          finalTranscript = mergeResults(e.results, srcLang);
+          interimTranscript = '';
+          showText(sourceEl, normalize(srcLang, finalTranscript), 'Здесь появится распознанный текст…');
           silenceTimer = setTimeout(() => {
             console.log("Пауза выдержана. Останавливаем запись...");
             rec.stop();
