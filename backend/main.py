@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import secrets
@@ -163,6 +164,27 @@ def translate_text(prompt: str, text: str) -> str:
     raise last_error
 
 
+TTS_ATTEMPTS = 3
+
+
+async def synthesize_speech(text: str, voice: str):
+    # Edge TTS периодически отвечает 403 (лимит запросов со стороны Microsoft), поэтому делаем
+    # несколько попыток с растущей паузой. Если не вышло — возвращаем None, перевод всё равно отдаётся,
+    # а страница озвучит его голосом браузера.
+    for attempt in range(1, TTS_ATTEMPTS + 1):
+        temp_file = tempfile.NamedTemporaryFile(delete=False, prefix=AUDIO_PREFIX, suffix=".mp3")
+        temp_file.close()
+        try:
+            await edge_tts.Communicate(text, voice).save(temp_file.name)
+            return os.path.basename(temp_file.name)
+        except Exception as e:
+            remove_file(temp_file.name)
+            print(f"[TTS] Попытка {attempt}/{TTS_ATTEMPTS} не удалась: {e}")
+            if attempt < TTS_ATTEMPTS:
+                await asyncio.sleep(0.7 * attempt)
+    return None
+
+
 @app.post("/api/translate", dependencies=[Depends(authenticate)])
 async def translate(request: TranslationRequest):
     if not request.text.strip():
@@ -180,16 +202,12 @@ async def translate(request: TranslationRequest):
         voice = get_voice_for_language(request.target_lang)
         print(f"[TTS LOG] Входной язык: '{request.target_lang}' -> Выбран голос: '{voice}'")
         tts_text = latin_to_cyrillic(translated_text) if voice.startswith("sr-") else translated_text
-        communicate = edge_tts.Communicate(tts_text, voice)
-
-        temp_file = tempfile.NamedTemporaryFile(delete=False, prefix=AUDIO_PREFIX, suffix=".mp3")
-        temp_file.close()
-        await communicate.save(temp_file.name)
+        audio_name = await synthesize_speech(tts_text, voice)
 
         return {
             "original_text": request.text,
             "translated_text": translated_text,
-            "audio_url": f"/api/audio/{os.path.basename(temp_file.name)}",
+            "audio_url": f"/api/audio/{audio_name}" if audio_name else None,
         }
     except Exception as e:
         print(f"Error: {e}")
