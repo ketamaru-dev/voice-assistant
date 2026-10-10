@@ -223,6 +223,8 @@
       const sep = lang === 'zh' || lang === 'ja' ? '' : ' ';
       let acc = '';
       for (let i = 0; i < results.length; i++) {
+        // Устаревший промежуточный результат (за ним уже пришёл следующий) пропускаем
+        if (results[i].isFinal === false && i < results.length - 1) continue;
         const t = results[i][0].transcript.trim();
         const tN = normText(t);
         if (!tN) continue;
@@ -231,6 +233,10 @@
         else if (accN.includes(tN)) continue;
         else {
           const aw = accN.split(' '), tw = tN.split(' '), tOrig = t.split(/\s+/);
+          // Новая версия той же фразы (распознавание поправило слова): общее начало из 2+ слов
+          let p = 0;
+          while (p < aw.length && p < tw.length && aw[p] === tw[p]) p++;
+          if (p >= 2) { acc = t; continue; }
           let k = Math.min(aw.length, tw.length);
           while (k > 0 && aw.slice(-k).join(' ') !== tw.slice(0, k).join(' ')) k--;
           acc += sep + tOrig.slice(k).join(sep);
