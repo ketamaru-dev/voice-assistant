@@ -205,19 +205,41 @@
       }
     }
 
-    // Android Chrome в режиме continuous присылает накопительные результаты (каждый содержит
-    // предыдущий текст), поэтому текст собираем заново из всех результатов без дублей
+    // Android Chrome в режиме continuous присылает накопительные результаты, причём финальный
+    // вариант отличается регистром и знаками препинания ("смотрю как" -> "Смотрю, как это...").
+    // Поэтому сравниваем тексты в нормализованном виде и склеиваем без дублей.
+    const normKey = s => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+    const normText = s => s.split(/\s+/).map(normKey).filter(Boolean).join(' ');
+
+    function collapseRepeats(words) {
+      const keys = words.map(normKey);
+      for (let p = 1; p <= keys.length / 2; p++) {
+        if (keys.length % p === 0 && keys.every((k, i) => k === keys[i % p])) return words.slice(0, p);
+      }
+      return words;
+    }
+
     function mergeResults(results, lang) {
       const sep = lang === 'zh' || lang === 'ja' ? '' : ' ';
       let acc = '';
       for (let i = 0; i < results.length; i++) {
         const t = results[i][0].transcript.trim();
-        if (!t) continue;
-        if (!acc || t.startsWith(acc)) acc = t;
-        else if (!acc.endsWith(t)) acc += sep + t;
+        const tN = normText(t);
+        if (!tN) continue;
+        const accN = normText(acc);
+        if (!accN || tN.startsWith(accN)) acc = t;
+        else if (accN.includes(tN)) continue;
+        else {
+          const aw = accN.split(' '), tw = tN.split(' '), tOrig = t.split(/\s+/);
+          let k = Math.min(aw.length, tw.length);
+          while (k > 0 && aw.slice(-k).join(' ') !== tw.slice(0, k).join(' ')) k--;
+          acc += sep + tOrig.slice(k).join(sep);
+        }
       }
-      return acc;
+      return lang === 'zh' || lang === 'ja' ? acc : collapseRepeats(acc.split(/\s+/)).join(' ');
     }
+
+    let lastSent = { text: '', time: 0 };
 
     function startListening(btn) {
       if (!SR) return setState('idle', 'Браузер не поддерживает распознавание речи');
@@ -295,6 +317,12 @@
 
     async function sendText(text, srcLang, tgtLang) {
       if (isProcessing) return;
+      const now = Date.now();
+      if (text === lastSent.text && now - lastSent.time < 8000) {
+        console.log("Повторная отправка той же фразы заблокирована");
+        return setState('idle', 'Готово!');
+      }
+      lastSent = { text, time: now };
       isProcessing = true;
       setState('processing', 'Перевожу...');
       try {
