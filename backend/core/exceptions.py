@@ -3,6 +3,7 @@ from __future__ import annotations
 
 GENERIC_ERROR_DETAIL = "Ошибка обработки запроса"
 RATE_LIMIT_DETAIL = "Превышено количество запросов, повторите позднее"
+LOGIN_RATE_LIMIT_DETAIL = "Слишком много попыток входа, повторите через минуту"
 
 
 class AppError(Exception):

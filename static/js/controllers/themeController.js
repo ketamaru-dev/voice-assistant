@@ -6,7 +6,7 @@ export function createThemeController({ themeService, toggleView }) {
   function init() {
     toggleView.render(themeService.init());
 
-    // Выбор вручную: сохраняем, применяем с анимацией и обновляем переключатель
+    // Выбор вручную: сохраняем, применяем и обновляем переключатель
     toggleView.onSelect(theme => {
       const applied = themeService.set(theme);
       toggleView.render(applied);

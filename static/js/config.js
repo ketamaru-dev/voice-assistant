@@ -19,6 +19,13 @@ export const DUPLICATE_WINDOW_MS = 8000;
 // Адрес API перевода
 export const TRANSLATE_URL = '/api/translate';
 
+// Авторизация: адреса API и страниц, ключ localStorage с Bearer-токеном ({ token, expiresAt })
+export const LOGIN_URL = '/api/login';
+export const SESSION_URL = '/api/session';
+export const LOGIN_PAGE = '/login';
+export const APP_PAGE = '/';
+export const TOKEN_STORAGE_KEY = 'voiceTranslator.token';
+
 // Ключ localStorage и срок жизни (мс) сохранённого неотправленного текста
 export const PENDING_STORAGE_KEY = 'voiceTranslator.pending';
 export const PENDING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -51,9 +58,6 @@ export const THEME_STORAGE_KEY = 'voiceTranslator.theme';
 
 // Цвет системной строки браузера (meta theme-color) для каждой темы
 export const THEME_COLORS = Object.freeze({ light: '#f3f5fa', dark: '#000000' });
-
-// Длительность (мс) анимации перехода между темами
-export const THEME_ANIMATION_MS = 700;
 
 // Media query системной тёмной темы (Chrome, Safari, Firefox на ПК, Android и iPhone)
 export const DARK_SCHEME_QUERY = '(prefers-color-scheme: dark)';

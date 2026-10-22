@@ -6,7 +6,7 @@ from functools import lru_cache
 from fastapi import Depends, HTTPException, Request
 
 from .core.config import get_settings
-from .core.exceptions import RATE_LIMIT_DETAIL
+from .core.exceptions import LOGIN_RATE_LIMIT_DETAIL, RATE_LIMIT_DETAIL
 from .core.rate_limit import SlidingWindowRateLimiter
 from .repositories.audio_repository import AudioRepository
 from .repositories.llm_repository import GroqLLMRepository
@@ -47,6 +47,19 @@ def get_translation_service() -> TranslationService:
 def get_rate_limiter() -> SlidingWindowRateLimiter:
     """Создаёт единый ограничитель частоты запросов."""
     return SlidingWindowRateLimiter(get_settings().rate_limit_per_minute)
+
+
+@lru_cache
+def get_login_rate_limiter() -> SlidingWindowRateLimiter:
+    """Создаёт отдельный (более строгий) ограничитель попыток входа для защиты от подбора пароля."""
+    return SlidingWindowRateLimiter(get_settings().login_attempts_per_minute)
+
+
+def login_rate_limit(request: Request, limiter: SlidingWindowRateLimiter = Depends(get_login_rate_limiter)) -> None:
+    """FastAPI-dependency: отвечает 429, если с одного IP слишком много попыток входа в минуту."""
+    client_ip = request.client.host if request.client else "unknown"
+    if not limiter.allow(client_ip):
+        raise HTTPException(status_code=429, detail=LOGIN_RATE_LIMIT_DETAIL, headers={"Retry-After": "60"})
 
 
 def rate_limit(request: Request, limiter: SlidingWindowRateLimiter = Depends(get_rate_limiter)) -> None:

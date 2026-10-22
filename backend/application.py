@@ -8,14 +8,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from .core.config import get_settings
 from .core.exceptions import GENERIC_ERROR_DETAIL, AppError
 from .core.logging_config import setup_logging
-from .core.security import AuthStaticFiles
 from .dependencies import get_audio_service
-from .routers import audio, docs, health, translate
+from .routers import audio, auth, docs, health, translate
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     setup_logging(settings.log_level)
 
-    # Стандартные маршруты документации отключены: свои (routers/docs.py) закрыты паролем
+    # Стандартные маршруты документации отключены: свои (routers/docs.py) подключаются только при ENABLE_DOCS=true
     app = FastAPI(title="Voice Translator", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
     if settings.allowed_origins:
@@ -89,9 +89,16 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     if settings.enable_docs:
         app.include_router(docs.router)
+    app.include_router(auth.router)
     app.include_router(translate.router)
     app.include_router(audio.router)
 
-    # Монтируется последней, чтобы API-роуты имели приоритет над раздачей статики
-    app.mount("/", AuthStaticFiles(directory=settings.static_dir, html=True), name="static")
+    @app.get("/login", include_in_schema=False)
+    async def login_page() -> FileResponse:
+        """Страница входа (адрес без расширения .html)."""
+        return FileResponse(settings.static_dir / "login.html", headers={"Cache-Control": "no-cache"})
+
+    # Статика публичная (в ней нет секретов): доступ к данным защищён Bearer-токеном на уровне API, а страница
+    # приложения сама отправляет на /login, если токена нет. Монтируется последней, чтобы API-роуты имели приоритет
+    app.mount("/", StaticFiles(directory=settings.static_dir, html=True), name="static")
     return app

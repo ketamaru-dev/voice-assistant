@@ -2,7 +2,7 @@
 //   1) если пользователь сам переключал тему — используется его выбор (хранится в localStorage);
 //   2) иначе — системная тема устройства (prefers-color-scheme: dark), и она отслеживается «вживую»;
 //   3) если системной тёмной темы нет — светлая (по умолчанию).
-import { DARK_SCHEME_QUERY, THEME, THEME_ANIMATION_MS, THEME_COLORS, THEME_STORAGE_KEY } from '../config.js';
+import { DARK_SCHEME_QUERY, THEME, THEME_COLORS, THEME_STORAGE_KEY } from '../config.js';
 import { subscribeToMediaQuery } from '../utils/mediaQuery.js';
 import { createSafeStorage } from '../utils/safeStorage.js';
 
@@ -15,10 +15,8 @@ export function createThemeService({
   storage = createSafeStorage(),
   root = typeof document !== 'undefined' ? document.documentElement : null,
   metaThemeColor = typeof document !== 'undefined' ? document.querySelector('meta[name="theme-color"]') : null,
-  timers = { setTimeout: (...args) => setTimeout(...args), clearTimeout: id => clearTimeout(id) },
 } = {}) {
   const systemDark = matchMedia(DARK_SCHEME_QUERY);
-  let animationTimer = null;
 
   // Читает ручной выбор пользователя; недопустимые и повреждённые значения игнорируются
   function getStoredTheme() {
@@ -40,18 +38,10 @@ export function createThemeService({
     return getStoredTheme() || getSystemTheme();
   }
 
-  // Применяет тему к странице: атрибут data-theme на <html>, цвет строки браузера и (если animate) плавный переход
-  function apply(theme, { animate = false } = {}) {
+  // Применяет тему к странице: атрибут data-theme на <html> и цвет строки браузера.
+  // Переключение мгновенное (один пересчёт стилей): плавные переходы цветов у всех элементов сильно тормозили Android
+  function apply(theme) {
     if (!root) return theme;
-    if (animate) {
-      // Класс включает плавные переходы цветов только на время смены темы
-      root.classList.add('theme-animating');
-      if (animationTimer) timers.clearTimeout(animationTimer);
-      animationTimer = timers.setTimeout(() => {
-        root.classList.remove('theme-animating');
-        animationTimer = null;
-      }, THEME_ANIMATION_MS);
-    }
     root.dataset.theme = theme;
     if (metaThemeColor) metaThemeColor.setAttribute('content', THEME_COLORS[theme]);
     return theme;
@@ -62,7 +52,7 @@ export function createThemeService({
     return apply(resolve());
   }
 
-  // Ручной выбор пользователя: сохраняет его и плавно переключает тему
+  // Ручной выбор пользователя: сохраняет его и переключает тему
   function set(theme) {
     if (!isTheme(theme)) return resolve();
     try {
@@ -70,7 +60,7 @@ export function createThemeService({
     } catch {
       // хранилище недоступно — тема всё равно применится до перезагрузки страницы
     }
-    return apply(theme, { animate: true });
+    return apply(theme);
   }
 
   // Подписывается на смену системной темы; пока пользователь не выбрал тему сам, интерфейс следует за системой.
@@ -78,7 +68,7 @@ export function createThemeService({
   function onSystemChange(callback) {
     return subscribeToMediaQuery(systemDark, () => {
       if (getStoredTheme()) return;
-      callback(apply(getSystemTheme(), { animate: true }));
+      callback(apply(getSystemTheme()));
     });
   }
 

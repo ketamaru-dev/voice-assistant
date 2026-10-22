@@ -3,7 +3,7 @@
 Запуск из корня проекта:  venv/bin/python -m unittest discover -s tests -t . -v
 """
 import asyncio
-import base64
+import json
 import os
 import tempfile
 import time
@@ -15,6 +15,7 @@ _TMP = tempfile.mkdtemp(prefix="vt_tests_")
 _STATIC = Path(_TMP) / "static"
 _STATIC.mkdir()
 (_STATIC / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+(_STATIC / "login.html").write_text("<html>login-form</html>", encoding="utf-8")
 os.environ.update({
     "GROQ_API_KEY": "test-key",
     "APP_USER": "tester",
@@ -23,6 +24,9 @@ os.environ.update({
     "STATIC_DIR": str(_STATIC),
     "MAX_TEXT_LENGTH": "50",   # в тестах лимит занижен, чтобы проверить 422 на длинном тексте
     "RATE_LIMIT_PER_MINUTE": "1000",
+    "LOGIN_ATTEMPTS_PER_MINUTE": "1000",
+    "ENABLE_DOCS": "true",
+    "TOKEN_TTL_MINUTES": "60",
 })
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -31,6 +35,7 @@ from backend import dependencies  # noqa: E402
 from backend.core.exceptions import (  # noqa: E402
     RATE_LIMIT_DETAIL, AudioNotFoundError, AudioTooLargeError, UpstreamRateLimitError)
 from backend.core.rate_limit import SlidingWindowRateLimiter  # noqa: E402
+from backend.core.security import check_credentials, issue_token, verify_token  # noqa: E402
 from backend.main import create_app  # noqa: E402
 from backend.repositories.audio_repository import AudioRepository  # noqa: E402
 from backend.schemas.translation import TranslationRequest  # noqa: E402
@@ -39,8 +44,9 @@ from backend.services.transliteration import latin_to_cyrillic  # noqa: E402
 from backend.services.translation_service import TranslationService, build_prompt  # noqa: E402
 from backend.services.voice_service import DEFAULT_VOICE, get_voice_for_language  # noqa: E402
 
-AUTH = {"Authorization": "Basic " + base64.b64encode(b"tester:a-long-test-password").decode()}
-BAD_AUTH = {"Authorization": "Basic " + base64.b64encode(b"tester:wrong").decode()}
+AUTH = {"Authorization": "Bearer " + issue_token("tester")[0]}
+BAD_AUTH = {"Authorization": "Bearer not-a-real-token"}
+LOGIN_BODY = {"username": "tester", "password": "a-long-test-password"}
 
 
 class FakeLLM:
@@ -274,8 +280,130 @@ class GroqRateLimitTests(unittest.TestCase):
             asyncio.run(service.translate(TranslationRequest(text="Привет", source_lang="ru", target_lang="en")))
 
 
+class TokenTests(unittest.TestCase):
+    """Выпуск и проверка подписанных Bearer-токенов."""
+
+    def test_roundtrip(self):
+        token, expires_in = issue_token("tester")
+        self.assertEqual(expires_in, 3600)
+        self.assertEqual(verify_token(token), "tester")
+
+    def test_expired_token_rejected(self):
+        token, _ = issue_token("tester", now=1_000_000)
+        self.assertEqual(verify_token(token, now=1_000_000 + 3599), "tester")
+        self.assertIsNone(verify_token(token, now=1_000_000 + 3600))
+
+    def test_tampered_token_rejected(self):
+        token, _ = issue_token("tester")
+        payload, signature = token.split(".")
+        self.assertIsNone(verify_token(f"{payload}.{signature[:-2]}AA"))
+        self.assertIsNone(verify_token(f"{payload}x.{signature}"))
+
+    def test_forged_payload_with_other_expiry_rejected(self):
+        import base64
+        token, _ = issue_token("tester", now=1_000_000)
+        payload, signature = token.split(".")
+        data = json.loads(base64.urlsafe_b64decode(payload + "=="))
+        data["exp"] += 10**9
+        forged = base64.urlsafe_b64encode(json.dumps(data).encode()).rstrip(b"=").decode()
+        self.assertIsNone(verify_token(f"{forged}.{signature}", now=1_000_000 + 7200))
+
+    def test_garbage_rejected_without_exceptions(self):
+        for bad in ["", "abc", ".", "a.b", "a.b.c", "\u0434\u0430.\u043d\u0435\u0442", "e30.e30", "x" * 5000]:
+            with self.subTest(token=bad[:20]):
+                self.assertIsNone(verify_token(bad))
+
+    def test_token_for_other_user_rejected(self):
+        token, _ = issue_token("someone-else")
+        self.assertIsNone(verify_token(token))
+
+    def test_credentials_check(self):
+        self.assertTrue(check_credentials("tester", "a-long-test-password"))
+        for user, password in [("tester", "wrong"), ("wrong", "a-long-test-password"), ("", ""), ("tester", "пароль")]:
+            with self.subTest(user=user):
+                self.assertFalse(check_credentials(user, password))
+
+    def test_secret_changes_with_password_and_can_be_set_explicitly(self):
+        from unittest import mock
+
+        from backend.core import config
+        original = config.get_settings().auth_secret
+
+        def secret_for(**env):
+            config.get_settings.cache_clear()
+            try:
+                with mock.patch.dict(os.environ, env), mock.patch.object(config, "load_dotenv"):
+                    return config.get_settings().auth_secret
+            finally:
+                config.get_settings.cache_clear()
+
+        self.assertEqual(secret_for(), original)  # производный секрет стабилен между запусками
+        self.assertNotEqual(secret_for(APP_PASSWORD="another-long-password"), original)
+        self.assertEqual(secret_for(AUTH_SECRET="explicit-secret"), "explicit-secret")
+
+    def test_docs_disabled_by_default(self):
+        from unittest import mock
+
+        from backend.core import config
+        config.get_settings.cache_clear()
+        try:
+            with mock.patch.dict(os.environ), mock.patch.object(config, "load_dotenv"):
+                os.environ.pop("ENABLE_DOCS")
+                self.assertFalse(config.get_settings().enable_docs)
+        finally:
+            config.get_settings.cache_clear()
+
+
+class LoginApiTests(unittest.TestCase):
+    """Эндпоинты /api/login и /api/session."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = create_app()
+        cls.client = TestClient(cls.app, raise_server_exceptions=False)
+
+    def test_login_success_returns_working_bearer_token(self):
+        response = self.client.post("/api/login", json=LOGIN_BODY)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual((data["token_type"], data["expires_in"]), ("bearer", 3600))
+        session = self.client.get("/api/session", headers={"Authorization": f"Bearer {data['access_token']}"})
+        self.assertEqual(session.json(), {"user": "tester"})
+
+    def test_login_wrong_credentials(self):
+        for body in [{**LOGIN_BODY, "password": "wrong"}, {**LOGIN_BODY, "username": "wrong"}]:
+            response = self.client.post("/api/login", json=body)
+            self.assertEqual(response.status_code, 401)
+            self.assertEqual(response.json(), {"detail": "Неверный логин или пароль"})
+            self.assertNotIn("access_token", response.text)
+
+    def test_login_validation(self):
+        for body in [{}, {"username": "tester"}, {"username": "", "password": ""}, {"username": "x" * 129, "password": "y"},
+                     {"username": "tester", "password": "p" * 257}]:
+            with self.subTest(body=str(body)[:30]):
+                self.assertEqual(self.client.post("/api/login", json=body).status_code, 422)
+
+    def test_login_attempts_are_rate_limited(self):
+        limiter = SlidingWindowRateLimiter(3, 60)
+        self.app.dependency_overrides[dependencies.get_login_rate_limiter] = lambda: limiter
+        try:
+            codes = [self.client.post("/api/login", json={**LOGIN_BODY, "password": "wrong"}).status_code for _ in range(4)]
+            blocked = self.client.post("/api/login", json=LOGIN_BODY)
+        finally:
+            del self.app.dependency_overrides[dependencies.get_login_rate_limiter]
+        self.assertEqual(codes, [401, 401, 401, 429])
+        self.assertEqual(blocked.status_code, 429)  # даже верный пароль не проходит, пока лимит исчерпан
+        self.assertEqual(blocked.headers["retry-after"], "60")
+
+    def test_expired_token_gives_session_expired_message(self):
+        token, _ = issue_token("tester", now=1_000_000)
+        response = self.client.get("/api/session", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"detail": "Сессия истекла, войдите снова"})
+
+
 class ApiTests(unittest.TestCase):
-    """Эндпоинты целиком: авторизация, валидация, одноразовая выдача аудио, обработка ошибок."""
+    """Эндпоинты целиком: защита токеном, валидация, одноразовая выдача аудио, обработка ошибок."""
 
     @classmethod
     def setUpClass(cls):
@@ -293,29 +421,40 @@ class ApiTests(unittest.TestCase):
     def test_healthz_is_public(self):
         self.assertEqual(self.client.get("/healthz").json(), {"status": "ok"})
 
-    def test_auth_required_everywhere(self):
-        self.assertEqual(self.client.get("/").status_code, 401)
+    def test_api_requires_bearer_token(self):
         self.assertEqual(self.client.post("/api/translate", json=self.BODY).status_code, 401)
         self.assertEqual(self.client.get("/api/audio/voice_x.mp3").status_code, 401)
+        self.assertEqual(self.client.get("/api/session").status_code, 401)
         self.assertEqual(self.client.post("/api/translate", json=self.BODY, headers=BAD_AUTH).status_code, 401)
+        response = self.client.get("/api/session")
+        self.assertEqual(response.headers["www-authenticate"], "Bearer")
+        self.assertEqual(response.json(), {"detail": "Требуется вход"})
 
-    def test_static_served_with_auth(self):
-        response = self.client.get("/", headers=AUTH)
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("ok", response.text)
+    def test_basic_auth_is_no_longer_accepted(self):
+        import base64
+        basic = {"Authorization": "Basic " + base64.b64encode(b"tester:a-long-test-password").decode()}
+        self.assertEqual(self.client.post("/api/translate", json=self.BODY, headers=basic).status_code, 401)
 
-    def test_docs_protected_but_available(self):
+    def test_static_pages_are_public_and_login_page_has_clean_url(self):
+        response = self.client.get("/")
+        self.assertEqual((response.status_code, "ok" in response.text), (200, True))
+        login = self.client.get("/login")
+        self.assertEqual(login.status_code, 200)
+        self.assertIn("login-form", login.text)
+
+    def test_docs_are_public_when_enabled_and_describe_bearer_auth(self):
         for path in ("/docs", "/redoc", "/openapi.json"):
-            self.assertEqual(self.client.get(path).status_code, 401, path)
-            self.assertEqual(self.client.get(path, headers=AUTH).status_code, 200, path)
-        schema = self.client.get("/openapi.json", headers=AUTH).json()
+            self.assertEqual(self.client.get(path).status_code, 200, path)
+        schema = self.client.get("/openapi.json").json()
         self.assertIn("/api/translate", schema["paths"])
+        self.assertIn("/api/login", schema["paths"])
         self.assertNotIn("/docs", schema["paths"])
+        self.assertEqual(schema["components"]["securitySchemes"]["HTTPBearer"]["scheme"], "bearer")
 
     def test_static_js_modules_served_with_js_mime(self):
         (_STATIC / "js").mkdir(exist_ok=True)
         (_STATIC / "js" / "main.js").write_text("export const a = 1;", encoding="utf-8")
-        response = self.client.get("/js/main.js", headers=AUTH)
+        response = self.client.get("/js/main.js")
         self.assertEqual(response.status_code, 200)
         self.assertIn("javascript", response.headers["content-type"])
 

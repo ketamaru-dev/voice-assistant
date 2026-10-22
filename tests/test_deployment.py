@@ -7,7 +7,6 @@
 Запуск из корня проекта:  venv/bin/pytest -v      (быстрые проверки без сервера:  pytest -m "not slow")
 """
 import ast
-import base64
 import importlib.metadata as metadata
 import json
 import os
@@ -34,7 +33,6 @@ IMPORT_TO_DIST = {"dotenv": "python-dotenv", "edge_tts": "edge-tts"}
 TRANSITIVE = {"pydantic", "starlette"}
 
 AUTH_USER, AUTH_PASSWORD = "deploy_user", "deploy-test-password-123"
-AUTH_HEADER = "Basic " + base64.b64encode(f"{AUTH_USER}:{AUTH_PASSWORD}".encode()).decode()
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +66,7 @@ def free_port() -> int:
 
 def clean_env(**extra) -> dict:
     """Окружение для подпроцесса без унаследованных настроек приложения (чтобы тест был воспроизводимым)."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("GROQ_", "APP_", "MAX_", "LLM_", "TTS_", "AUDIO_", "STATIC_", "RATE_", "ENABLE_", "ALLOWED_", "MODEL_", "LOG_", "CLEANUP_"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("GROQ_", "APP_", "MAX_", "LLM_", "TTS_", "AUDIO_", "STATIC_", "RATE_", "ENABLE_", "ALLOWED_", "MODEL_", "LOG_", "CLEANUP_", "AUTH_", "TOKEN_", "LOGIN_"))}
     env.update(extra)
     return env
 
@@ -84,9 +82,21 @@ def app_env(tmp_path: Path, **overrides) -> dict:
     return clean_env(**settings)
 
 
+_TOKENS: dict = {}
+
+
+def login_token(port: int) -> str:
+    """Входит под тестовым пользователем и возвращает Bearer-токен (кэшируется на время работы сервера)."""
+    if port not in _TOKENS:
+        status, _, body = http(port, "/api/login", auth=False, method="POST", body={"username": AUTH_USER, "password": AUTH_PASSWORD})
+        assert status == 200, body
+        _TOKENS[port] = json.loads(body)["access_token"]
+    return _TOKENS[port]
+
+
 def http(port: int, path: str, *, auth=True, method="GET", body=None):
-    """HTTP-запрос к локальному серверу: возвращает (статус, заголовки, тело)."""
-    headers = {"Authorization": AUTH_HEADER} if auth else {}
+    """HTTP-запрос к локальному серверу (auth=True добавляет Bearer-токен): возвращает (статус, заголовки, тело)."""
+    headers = {"Authorization": f"Bearer {login_token(port)}"} if auth else {}
     data = None
     if body is not None:
         data = json.dumps(body).encode()
@@ -306,26 +316,47 @@ def server(request, tmp_path):
 
 
 @pytest.mark.slow
-def test_server_health_and_auth(server):
+def test_server_health_and_bearer_protection(server):
     assert http(server, "/healthz", auth=False)[0] == 200
-    status, headers, _ = http(server, "/", auth=False)
+    status, headers, _ = http(server, "/api/session", auth=False)
     assert status == 401
-    assert "Basic" in headers.get("www-authenticate", "")
+    assert headers.get("www-authenticate") == "Bearer"
+    assert http(server, "/api/session")[0] == 200
+
+
+@pytest.mark.slow
+def test_server_login_flow(server):
+    assert http(server, "/api/login", auth=False, method="POST", body={"username": AUTH_USER, "password": "wrong"})[0] == 401
+    status, _, body = http(server, "/api/login", auth=False, method="POST", body={"username": AUTH_USER, "password": AUTH_PASSWORD})
+    assert status == 200 and json.loads(body)["token_type"] == "bearer"
+
+
+@pytest.mark.slow
+def test_server_blocks_password_guessing(server):
+    wrong = {"username": AUTH_USER, "password": "wrong"}
+    codes = [http(server, "/api/login", auth=False, method="POST", body=wrong)[0] for _ in range(12)]
+    assert codes[:10] == [401] * 10
+    assert 429 in codes[10:], "после 10 попыток в минуту вход должен блокироваться"
+    # Даже верный пароль не пускает, пока лимит исчерпан
+    assert http(server, "/api/login", auth=False, method="POST", body={"username": AUTH_USER, "password": AUTH_PASSWORD})[0] == 429
 
 
 @pytest.mark.slow
 def test_server_serves_page_and_all_modules(server):
-    status, _, html = http(server, "/")
+    status, _, html = http(server, "/", auth=False)  # страница публичная: токен проверяется на уровне API
     assert status == 200
     assert 'id="mic-from"' in html
+    status, _, login_html = http(server, "/login", auth=False)
+    assert status == 200 and 'id="login-form"' in login_html
+    assert http(server, "/login.html", auth=False)[0] == 200
     # Все модули, на которые ссылаются import-ы, отдаются с JavaScript MIME-типом
-    pending, seen = ["/js/main.js"], set()
+    pending, seen = ["/js/main.js", "/js/login.js"], set()
     while pending:
         path = pending.pop()
         if path in seen:
             continue
         seen.add(path)
-        status, headers, source = http(server, path)
+        status, headers, source = http(server, path, auth=False)
         assert status == 200, path
         assert "javascript" in headers.get("content-type", ""), path
         for rel in re.findall(r"from '(\.[^']+)'", source):
@@ -338,9 +369,9 @@ def test_server_security_headers_and_docs(server):
     _, headers, _ = http(server, "/healthz", auth=False)
     assert headers.get("x-content-type-options") == "nosniff"
     assert "microphone=(self)" in headers.get("permissions-policy", "")
-    assert http(server, "/docs", auth=False)[0] == 401
-    assert http(server, "/docs")[0] == 200
-    assert "/api/translate" in http(server, "/openapi.json")[2]
+    # В тестовой конфигурации ENABLE_DOCS=true: документация открыта, но сами эндпоинты всё равно требуют токен
+    assert http(server, "/docs", auth=False)[0] == 200
+    assert "/api/translate" in http(server, "/openapi.json", auth=False)[2]
 
 
 @pytest.mark.slow

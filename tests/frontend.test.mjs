@@ -8,6 +8,10 @@ import { createKeyboardController } from '../static/js/controllers/keyboardContr
 import { createThemeService } from '../static/js/services/themeService.js';
 import { createDeviceService } from '../static/js/services/deviceService.js';
 import { createTranslatorController } from '../static/js/controllers/translatorController.js';
+import { createAuthRepository } from '../static/js/repositories/authRepository.js';
+import { createLoginController } from '../static/js/controllers/loginController.js';
+import { createLoginView } from '../static/js/views/loginView.js';
+import { createPlaybackService } from '../static/js/services/playbackService.js';
 import { createPendingRepository } from '../static/js/repositories/pendingRepository.js';
 import { requestTranslation } from '../static/js/repositories/translateRepository.js';
 import { createRecognitionService, describeRecognitionError } from '../static/js/services/recognitionService.js';
@@ -515,9 +519,8 @@ function makeLiveTheme(options = {}) {
   const classes = new Set();
   const root = { dataset: {}, classList: { add: c => classes.add(c), remove: c => classes.delete(c), contains: c => classes.has(c) } };
   const meta = { content: '', setAttribute(name, value) { if (name === 'content') this.content = value; } };
-  const t = makeFakeTimers();
-  const service = createThemeService({ matchMedia: media.matchMedia, storage, root, metaThemeColor: meta, timers: t.timers });
-  return { service, root, meta, storage, timers: t, classes, setSystemDark(v) { state[DARK_QUERY] = v; media.queries.forEach(q => q.fire()); } };
+  const service = createThemeService({ matchMedia: media.matchMedia, storage, root, metaThemeColor: meta });
+  return { service, root, meta, storage, classes, setSystemDark(v) { state[DARK_QUERY] = v; media.queries.forEach(q => q.fire()); } };
 }
 
 test('theme: по умолчанию светлая (нет выбора пользователя и системной тёмной)', () => {
@@ -539,23 +542,21 @@ test('theme: ручной выбор важнее системной темы', 
 test('theme: недопустимое сохранённое значение игнорируется', () => {
   eq(makeLiveTheme({ systemDark: true, stored: 'purple' }).service.init(), THEME.DARK);
 });
-test('theme: set сохраняет выбор, применяет тему с анимацией, а класс анимации потом снимается', () => {
+test('theme: set сохраняет выбор и мгновенно применяет тему без классов анимации', () => {
   const h = makeLiveTheme();
   h.service.init();
   eq(h.service.set(THEME.DARK), 'dark');
   eq(h.storage.getItem(THEME_STORAGE_KEY), 'dark');
   eq(h.root.dataset.theme, 'dark');
-  ok(h.classes.has('theme-animating'), 'анимация включена');
-  h.timers.tick();
-  ok(!h.classes.has('theme-animating'), 'анимация выключена по таймеру');
+  eq(h.meta.content, THEME_COLORS.dark);
+  eq([...h.classes], [], 'тяжёлые переходы цветов отключены');
   eq(h.service.resolve(), 'dark', 'выбор переживает «перезагрузку»');
 });
-test('theme: повторные быстрые переключения не оставляют класс анимации навсегда', () => {
+test('theme: быстрые повторные переключения оставляют последнюю тему', () => {
   const h = makeLiveTheme();
   h.service.set(THEME.DARK); h.service.set(THEME.LIGHT); h.service.set(THEME.DARK);
-  h.timers.tick();
-  ok(!h.classes.has('theme-animating'));
   eq(h.root.dataset.theme, 'dark');
+  eq([...h.classes], []);
 });
 test('theme: set с неизвестным названием ничего не меняет', () => {
   const h = makeLiveTheme();
@@ -864,6 +865,269 @@ test('view: setRetryVisible управляет атрибутом hidden, кли
   view.onSwapClick(() => clicks.push('swap'));
   els['mic-from'].click(); els['mic-to'].click(); els['retry-btn'].click(); els['swap-btn'].click();
   eq(clicks, ['from', 'to', 'retry', 'swap']);
+});
+
+// ---------- авторизация (Bearer-токен) ----------
+const TOKEN_KEY = 'voiceTranslator.token';
+function makeAuth({ responses = [], stored, now = 1_000_000 } = {}) {
+  const storage = memoryStorage();
+  if (stored) storage.setItem(TOKEN_KEY, JSON.stringify(stored));
+  const calls = { fetch: [], navigate: [] };
+  const queueOfResponses = [...responses];
+  const fetchFn = async (url, init) => {
+    calls.fetch.push({ url, init });
+    const next = queueOfResponses.shift();
+    if (next instanceof Error) throw next;
+    return next;
+  };
+  const auth = createAuthRepository({ storage, now: () => now, fetchFn, navigate: url => calls.navigate.push(url) });
+  return { auth, storage, calls, now };
+}
+const validToken = { token: 'abc.def', expiresAt: 2_000_000 };
+
+test('auth: getToken возвращает действующий токен', () => {
+  eq(makeAuth({ stored: validToken }).auth.getToken(), 'abc.def');
+});
+test('auth: просроченный или повреждённый токен считается отсутствующим и удаляется', () => {
+  const expired = makeAuth({ stored: { token: 'abc', expiresAt: 999_999 } });
+  eq(expired.auth.getToken(), null);
+  eq(expired.storage.getItem(TOKEN_KEY), null);
+  const broken = makeAuth();
+  broken.storage.setItem(TOKEN_KEY, '{not json');
+  eq(broken.auth.getToken(), null);
+  eq(makeAuth({ stored: { token: '', expiresAt: 2_000_000 } }).auth.getToken(), null);
+  eq(makeAuth().auth.getToken(), null);
+});
+test('auth: login отправляет JSON и сохраняет токен со сроком жизни', async () => {
+  const h = makeAuth({ responses: [fakeResponse(200, { access_token: 'tok', token_type: 'bearer', expires_in: 3600 })] });
+  await h.auth.login('user', 'pass');
+  eq(h.calls.fetch[0].url, '/api/login');
+  eq(JSON.parse(h.calls.fetch[0].init.body), { username: 'user', password: 'pass' });
+  eq(JSON.parse(h.storage.getItem(TOKEN_KEY)), { token: 'tok', expiresAt: 1_000_000 + 3_600_000 });
+});
+test('auth: login показывает сообщение сервера и не сохраняет токен', async () => {
+  const run = async response => {
+    const h = makeAuth({ responses: [response] });
+    let message = null;
+    try { await h.auth.login('u', 'p'); } catch (e) { message = e.message; }
+    eq(h.storage.getItem(TOKEN_KEY), null);
+    return message;
+  };
+  eq(await run(fakeResponse(401, { detail: 'Неверный логин или пароль' })), 'Неверный логин или пароль');
+  eq(await run(fakeResponse(429, { detail: 'Слишком много попыток входа, повторите через минуту' })), 'Слишком много попыток входа, повторите через минуту');
+  eq(await run(fakeResponse(422, { detail: [{ msg: 'x' }] })), 'Введите логин и пароль');
+  eq(await run(fakeResponse(500)), 'Ошибка сервера (500)');
+  eq(await run(new TypeError('Failed to fetch')), 'Не удалось связаться с сервером. Проверьте соединение');
+});
+test('auth: authFetch добавляет заголовок Bearer и сохраняет остальные заголовки', async () => {
+  const h = makeAuth({ stored: validToken, responses: [fakeResponse(200, {})] });
+  await h.auth.authFetch('/api/translate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  eq(h.calls.fetch[0].init.headers, { 'Content-Type': 'application/json', Authorization: 'Bearer abc.def' });
+  eq(h.calls.fetch[0].init.method, 'POST');
+  eq(h.calls.navigate, []);
+});
+test('auth: ответ 401 забывает токен, открывает страницу входа и сообщает об ошибке', async () => {
+  const h = makeAuth({ stored: validToken, responses: [fakeResponse(401, { detail: 'x' })] });
+  let message = null;
+  try { await h.auth.authFetch('/api/translate'); } catch (e) { message = e.message; }
+  eq(message, 'Сессия истекла, войдите снова');
+  eq(h.storage.getItem(TOKEN_KEY), null);
+  eq(h.calls.navigate, ['/login']);
+});
+test('auth: без токена запрос не отправляется, а открывается страница входа', async () => {
+  const h = makeAuth();
+  let message = null;
+  try { await h.auth.authFetch('/api/translate'); } catch (e) { message = e.message; }
+  eq(message, 'Требуется вход');
+  eq(h.calls.fetch, []);
+  eq(h.calls.navigate, ['/login']);
+});
+test('auth: logout забывает токен и открывает страницу входа', () => {
+  const h = makeAuth({ stored: validToken });
+  h.auth.logout();
+  eq([h.storage.getItem(TOKEN_KEY), h.calls.navigate], [null, ['/login']]);
+});
+test('auth: verifySession при 401 отправляет на вход, а сетевой сбой игнорирует', async () => {
+  const expired = makeAuth({ stored: validToken, responses: [fakeResponse(401, {})] });
+  await expired.auth.verifySession();
+  eq(expired.calls.navigate, ['/login']);
+  const offline = makeAuth({ stored: validToken, responses: [new TypeError('offline')] });
+  await offline.auth.verifySession();
+  eq([offline.calls.navigate, offline.storage.getItem(TOKEN_KEY) !== null], [[], true]);
+});
+test('translateRepository: через authFetch просроченная сессия даёт понятную ошибку', async () => {
+  const h = makeAuth({ stored: validToken, responses: [fakeResponse(401, { detail: 'Сессия истекла, войдите снова' })] });
+  let message = null;
+  try { await requestTranslation({ text: 'a', sourceLang: 'ru', targetLang: 'en' }, { fetchFn: h.auth.authFetch }); } catch (e) { message = e.message; }
+  eq(message, 'Сессия истекла, войдите снова');
+  eq(h.calls.navigate, ['/login']);
+});
+
+// ---------- страница входа ----------
+function makeLoginView() {
+  const listeners = {};
+  const el = (extra = {}) => ({
+    value: '', disabled: false, textContent: '', type: 'text', attrs: {}, focused: 0,
+    setAttribute(name, value) { this.attrs[name] = value; },
+    addEventListener(type, cb) { (listeners[this.id] ||= {})[type] = cb; },
+    focus() { this.focused++; },
+    ...extra,
+  });
+  const els = {
+    'login-form': el({ id: 'login-form' }), 'login-username': el({ id: 'login-username' }),
+    'login-password': el({ id: 'login-password', type: 'password' }), 'login-submit': el({ id: 'login-submit', textContent: 'Войти' }),
+    'login-error': el({ id: 'login-error' }), 'login-reveal': el({ id: 'login-reveal' }),
+  };
+  const view = createLoginView({ getElementById: id => els[id] });
+  return { view, els, fire: (id, type, event = {}) => listeners[id][type](event) };
+}
+test('loginView: values обрезает пробелы в логине, но не трогает пароль', () => {
+  const { view, els } = makeLoginView();
+  els['login-username'].value = '  admin ';
+  els['login-password'].value = ' p a ss ';
+  eq(view.values(), { username: 'admin', password: ' p a ss ' });
+});
+test('loginView: отправка формы отменяет перезагрузку страницы', () => {
+  const { view, fire } = makeLoginView();
+  let calls = 0; let prevented = false;
+  view.onSubmit(() => calls++);
+  fire('login-form', 'submit', { preventDefault: () => { prevented = true; } });
+  eq([calls, prevented], [1, true]);
+});
+test('loginView: кнопка глаза показывает и скрывает пароль', () => {
+  const { view, els, fire } = makeLoginView();
+  view.onSubmit(() => {});
+  fire('login-reveal', 'click');
+  eq([els['login-password'].type, els['login-reveal'].attrs['aria-pressed'], els['login-reveal'].attrs['aria-label']], ['text', 'true', 'Скрыть пароль']);
+  fire('login-reveal', 'click');
+  eq([els['login-password'].type, els['login-reveal'].attrs['aria-pressed']], ['password', 'false']);
+});
+test('loginView: setBusy блокирует форму, showError и focus работают', () => {
+  const { view, els } = makeLoginView();
+  view.setBusy(true);
+  eq([els['login-submit'].disabled, els['login-password'].disabled, els['login-submit'].textContent], [true, true, 'Входим…']);
+  view.setBusy(false);
+  eq([els['login-submit'].disabled, els['login-submit'].textContent], [false, 'Войти']);
+  view.showError('Ошибка');
+  eq([els['login-error'].textContent, els['login-password'].attrs['aria-invalid']], ['Ошибка', 'true']);
+  view.showError('');
+  eq(els['login-password'].attrs['aria-invalid'], 'false');
+  els['login-password'].value = 'secret';
+  view.focus('password');
+  eq([els['login-password'].value, els['login-password'].focused], ['', 1]);
+  view.focus('username');
+  eq(els['login-username'].focused, 1);
+});
+
+function makeLoginController({ token = null, login = async () => {}, username = 'admin', password = 'secret' } = {}) {
+  const log = [];
+  let submitHandler = null;
+  const view = {
+    values: () => ({ username, password }),
+    onSubmit: handler => { submitHandler = handler; },
+    setBusy: busy => log.push(['busy', busy]),
+    showError: message => log.push(['error', message]),
+    focus: field => log.push(['focus', field]),
+  };
+  const auth = { getToken: () => token, login: async (u, p) => { log.push(['login', u, p]); await login(u, p); }, navigate: url => log.push(['navigate', url]), appPage: '/' };
+  const controller = createLoginController({ view, auth });
+  controller.init();
+  return { controller, log, submit: () => submitHandler() };
+}
+test('loginController: если токен уже есть, сразу открывается приложение', () => {
+  const h = makeLoginController({ token: 'abc' });
+  eq(h.log, [['navigate', '/']]);
+});
+test('loginController: без токена показывается форма с фокусом на логине', () => {
+  eq(makeLoginController().log, [['focus', 'username']]);
+});
+test('loginController: пустые поля не отправляются на сервер', async () => {
+  const h = makeLoginController({ username: '', password: '' });
+  h.log.length = 0;
+  await h.submit();
+  eq(h.log, [['error', 'Введите логин и пароль'], ['focus', 'username']]);
+  const noPassword = makeLoginController({ password: '' });
+  noPassword.log.length = 0;
+  await noPassword.submit();
+  eq(noPassword.log, [['error', 'Введите логин и пароль'], ['focus', 'password']]);
+});
+test('loginController: успешный вход открывает приложение', async () => {
+  const h = makeLoginController();
+  h.log.length = 0;
+  await h.submit();
+  eq(h.log, [['error', ''], ['busy', true], ['login', 'admin', 'secret'], ['navigate', '/']]);
+});
+test('loginController: ошибка входа показывает сообщение и очищает пароль', async () => {
+  const h = makeLoginController({ login: async () => { throw new Error('Неверный логин или пароль'); } });
+  h.log.length = 0;
+  await h.submit();
+  eq(h.log, [['error', ''], ['busy', true], ['login', 'admin', 'secret'], ['busy', false], ['error', 'Неверный логин или пароль'], ['focus', 'password']]);
+});
+test('loginController: повторная отправка во время входа игнорируется', async () => {
+  let release;
+  const h = makeLoginController({ login: () => new Promise(resolve => { release = resolve; }) });
+  h.log.length = 0;
+  const first = h.submit();
+  await flush();
+  await h.submit();
+  release();
+  await first;
+  eq(h.log.filter(entry => entry[0] === 'login').length, 1);
+});
+
+// ---------- воспроизведение озвучки с токеном ----------
+function makePlayback({ fetchAudio, playResult = () => Promise.resolve() } = {}) {
+  globalThis.window = globalThis.window || {}; // в jsc нет window: speechSynthesis «недоступен», запасной голос сразу вызывает onDone
+  const log = { audios: [], revoked: [], created: [] };
+  const urlApi = { createObjectURL: blob => { log.created.push(blob); return `blob:${log.created.length}`; }, revokeObjectURL: url => log.revoked.push(url) };
+  const createAudio = src => {
+    const audio = { src, paused: false, play: () => playResult(audio), pause() { this.paused = true; } };
+    log.audios.push(audio);
+    return audio;
+  };
+  return { playback: createPlaybackService({ fetchAudio, createAudio, urlApi }), log };
+}
+test('playback: MP3 скачивается с токеном, проигрывается и освобождает ссылку по окончании', async () => {
+  const h = makePlayback({ fetchAudio: async url => ({ url }) });
+  let done = 0;
+  h.playback.playAudio({ url: '/api/audio/voice_a.mp3', fallbackText: 'Hi', lang: 'en', onDone: () => done++ });
+  await flush();
+  eq(h.log.created, [{ url: '/api/audio/voice_a.mp3' }]);
+  eq(h.log.audios[0].src, 'blob:1');
+  h.log.audios[0].onended();
+  eq([done, h.log.revoked], [1, ['blob:1']]);
+});
+test('playback: ошибка загрузки аудио приводит к запасному голосу браузера', async () => {
+  const h = makePlayback({ fetchAudio: async () => { throw new Error('401'); } });
+  let done = 0;
+  h.playback.playAudio({ url: '/api/audio/x.mp3', fallbackText: 'Hi', lang: 'en', onDone: () => done++ });
+  await flush();
+  eq([done, h.log.audios.length], [1, 0]);
+});
+test('playback: если браузер запретил автозапуск, срабатывает запасной голос и ссылка освобождается', async () => {
+  const h = makePlayback({ fetchAudio: async () => ({}), playResult: () => Promise.reject(new Error('NotAllowedError')) });
+  let done = 0;
+  h.playback.playAudio({ url: '/api/audio/x.mp3', fallbackText: 'Hi', lang: 'en', onDone: () => done++ });
+  await flush();
+  eq([done, h.log.revoked], [1, ['blob:1']]);
+});
+test('playback: stop во время загрузки отменяет воспроизведение без onDone', async () => {
+  let resolveFetch;
+  const h = makePlayback({ fetchAudio: () => new Promise(resolve => { resolveFetch = resolve; }) });
+  let done = 0;
+  h.playback.playAudio({ url: '/api/audio/x.mp3', fallbackText: 'Hi', lang: 'en', onDone: () => done++ });
+  h.playback.stop();
+  resolveFetch({});
+  await flush();
+  eq([done, h.log.audios.length, h.log.created.length], [0, 0, 0]);
+});
+test('playback: stop во время проигрывания останавливает звук и освобождает ссылку', async () => {
+  const h = makePlayback({ fetchAudio: async () => ({}) });
+  let done = 0;
+  h.playback.playAudio({ url: '/api/audio/x.mp3', fallbackText: 'Hi', lang: 'en', onDone: () => done++ });
+  await flush();
+  h.playback.stop();
+  eq([h.log.audios[0].paused, h.log.revoked, done], [true, ['blob:1'], 0]);
 });
 
 // ---------- запуск ----------

@@ -1,13 +1,37 @@
 // Сервис воспроизведения озвучки: сначала MP3 с сервера, при неудаче — голос браузера (speechSynthesis).
+// MP3 запрашивается через fetch с Bearer-токеном (элемент <audio> не умеет отправлять заголовок Authorization).
 import { SPEECH_LANGS } from '../config.js';
+import { authRepository } from '../repositories/authRepository.js';
 
-// Создаёт сервис воспроизведения; langs — таблица кодов языков для speechSynthesis
-export function createPlaybackService({ langs = SPEECH_LANGS } = {}) {
+// Скачивает аудио с токеном и возвращает Blob
+async function fetchAudioBlob(url) {
+  const response = await authRepository.authFetch(url);
+  if (!response.ok) throw new Error(`Аудио недоступно (${response.status})`);
+  return response.blob();
+}
+
+// Создаёт сервис воспроизведения; langs — таблица кодов языков для speechSynthesis, остальное подменяется в тестах
+export function createPlaybackService({
+  langs = SPEECH_LANGS,
+  fetchAudio = fetchAudioBlob,
+  createAudio = src => new Audio(src),
+  urlApi = typeof URL !== 'undefined' ? URL : null,
+} = {}) {
   let currentAudio = null;
   let currentUtterance = null;
+  let currentObjectUrl = null;
+  let playId = 0; // номер текущего воспроизведения: устаревшие загрузки после stop() отбрасываются
+
+  // Освобождает временную ссылку на скачанное аудио
+  function releaseObjectUrl() {
+    if (currentObjectUrl) urlApi.revokeObjectURL(currentObjectUrl);
+    currentObjectUrl = null;
+  }
 
   // Останавливает любое воспроизведение и отключает обработчики, чтобы они не вызвали onDone после ручной остановки
   function stop() {
+    playId += 1;
+    releaseObjectUrl();
     if (currentAudio) {
       currentAudio.onended = currentAudio.onerror = null;
       currentAudio.pause();
@@ -33,20 +57,31 @@ export function createPlaybackService({ langs = SPEECH_LANGS } = {}) {
     speechSynthesis.speak(utterance);
   }
 
-  // Проигрывает MP3 по ссылке; если файл не загрузился или автозапуск запрещён — озвучивает fallbackText голосом браузера
+  // Скачивает MP3 по ссылке (с токеном) и проигрывает; если файл не загрузился или автозапуск запрещён —
+  // озвучивает fallbackText голосом браузера
   function playAudio({ url, fallbackText, lang, onDone }) {
-    const audio = new Audio(url);
-    currentAudio = audio;
+    const id = ++playId;
+    releaseObjectUrl();
     let fellBack = false;
     const fallback = () => {
-      if (fellBack) return;
+      if (fellBack || id !== playId) return;
       fellBack = true;
+      releaseObjectUrl();
       currentAudio = null;
       speak(fallbackText, lang, onDone);
     };
-    audio.onended = onDone;
-    audio.onerror = fallback;
-    audio.play().catch(fallback);
+    fetchAudio(url).then(blob => {
+      if (id !== playId) return undefined; // воспроизведение остановили, пока файл скачивался
+      currentObjectUrl = urlApi.createObjectURL(blob);
+      const audio = createAudio(currentObjectUrl);
+      currentAudio = audio;
+      audio.onended = () => {
+        releaseObjectUrl();
+        onDone();
+      };
+      audio.onerror = fallback;
+      return audio.play();
+    }).catch(fallback);
   }
 
   return { stop, speak, playAudio };

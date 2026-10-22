@@ -1,6 +1,7 @@
 """Конфигурация приложения: чтение и валидация переменных окружения."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from dataclasses import dataclass
@@ -41,6 +42,9 @@ class Settings:
     audio_ttl_seconds: int
     cleanup_interval_seconds: int
     rate_limit_per_minute: int
+    auth_secret: str
+    token_ttl_minutes: int
+    login_attempts_per_minute: int
 
 
 def _env_int(name: str, default: int) -> int:
@@ -68,6 +72,17 @@ def _env_list(name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _auth_secret() -> str:
+    """Секрет подписи токенов: AUTH_SECRET, а если не задан — производный от логина и пароля.
+
+    Так токены переживают перезапуск сервера, а смена пароля или логина автоматически отзывает все выданные токены."""
+    explicit = os.getenv("AUTH_SECRET", "").strip()
+    if explicit:
+        return explicit
+    material = f"voice-translator-token\0{os.environ['APP_USER']}\0{os.environ['APP_PASSWORD']}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
 @lru_cache
 def get_settings() -> Settings:
     """Загружает .env, проверяет обязательные переменные и возвращает единый (кэшируемый) объект настроек."""
@@ -93,11 +108,14 @@ def get_settings() -> Settings:
         # Длинные тексты (до ~10000 символов) переводятся дольше, поэтому таймаут и лимит ответа увеличены
         llm_timeout_seconds=_env_int("LLM_TIMEOUT_SECONDS", 90),
         llm_max_tokens=_env_int("LLM_MAX_TOKENS", 16384),
-        # Документация API (/docs, /redoc) включена по умолчанию на время проверки; защищена паролем
-        enable_docs=_env_bool("ENABLE_DOCS", True),
+        # Документация API (/docs, /redoc) по умолчанию выключена: при включении она открыта всем (токен вводится кнопкой Authorize)
+        enable_docs=_env_bool("ENABLE_DOCS", False),
         audio_ttl_seconds=_env_int("AUDIO_TTL_SECONDS", 300),
         cleanup_interval_seconds=_env_int("CLEANUP_INTERVAL_SECONDS", 120),
         rate_limit_per_minute=_env_int("RATE_LIMIT_PER_MINUTE", 30),
+        auth_secret=_auth_secret(),
+        token_ttl_minutes=_env_int("TOKEN_TTL_MINUTES", 720),
+        login_attempts_per_minute=_env_int("LOGIN_ATTEMPTS_PER_MINUTE", 10),
     )
 
     if settings.app_password.lower() in _WEAK_PASSWORDS or len(settings.app_password) < 8:

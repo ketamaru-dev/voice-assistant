@@ -1,5 +1,6 @@
 // Репозиторий API перевода: единственное место, где фронтенд обращается к серверу.
 import { TRANSLATE_URL } from '../config.js';
+import { authRepository } from './authRepository.js';
 
 // Достаёт из ответа сервера понятное сообщение об ошибке (detail бывает строкой или списком ошибок валидации)
 function extractError(data, status) {
@@ -10,7 +11,7 @@ function extractError(data, status) {
 }
 
 // Отправляет текст на перевод и возвращает JSON ответа; при ошибке HTTP выбрасывает Error с сообщением сервера
-export async function requestTranslation({ text, sourceLang, targetLang }, { fetchFn = (...args) => fetch(...args), url = TRANSLATE_URL } = {}) {
+export async function requestTranslation({ text, sourceLang, targetLang }, { fetchFn = authRepository.authFetch, url = TRANSLATE_URL } = {}) {
   const response = await fetchFn(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

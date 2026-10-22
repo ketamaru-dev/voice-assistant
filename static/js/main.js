@@ -3,6 +3,7 @@ import { DUPLICATE_WINDOW_MS, PENDING_MAX_AGE_MS, PENDING_STORAGE_KEY } from './
 import { createKeyboardController } from './controllers/keyboardController.js';
 import { createThemeController } from './controllers/themeController.js';
 import { createTranslatorController } from './controllers/translatorController.js';
+import { authRepository } from './repositories/authRepository.js';
 import { createPendingRepository } from './repositories/pendingRepository.js';
 import { requestTranslation } from './repositories/translateRepository.js';
 import { createDeviceService } from './services/deviceService.js';
@@ -23,6 +24,10 @@ function bootstrap() {
 
   // Тема оформления: светлая по умолчанию, тёмная по системной настройке или по выбору пользователя
   createThemeController({ themeService: createThemeService(), toggleView: createThemeToggleView() }).init();
+
+  // Авторизация: кнопка выхода и проверка токена на сервере (если токен недействителен, откроется страница входа)
+  document.getElementById('logout-btn').addEventListener('click', () => authRepository.logout());
+  authRepository.verifySession();
 
   const view = createTranslatorView();
   const controller = createTranslatorController({
